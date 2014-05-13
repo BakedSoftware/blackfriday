@@ -36,12 +36,13 @@ func init() {
 		"dd", "dl", "dt",
 	})
 	whitelistAttrs = map[string]map[string]bool{
-		"a":   toSet([]string{"href", "title", "rel"}),
-		"img": toSet([]string{"src", "alt", "title"}),
+		"a":   toSet([]string{"href", "title", "rel", "class"}),
+		"img": toSet([]string{"src", "alt", "title", "class", "id"}),
+		"div": toSet([]string{"class", "id"}),
 	}
 	protocolAttrs = map[string]map[string]bool{
-		"a":   toSet([]string{"href"}),
-		"img": toSet([]string{"src"}),
+		"a": toSet([]string{"href"}),
+		//"img": toSet([]string{"src"}),
 	}
 	whitelistProtocols = [][]byte{
 		[]byte("http://"),
