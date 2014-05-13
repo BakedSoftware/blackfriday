@@ -25,24 +25,24 @@ func init() {
 		"p", "pre", "blockquote", "hr", "div", "header", "article", "aside", "footer",
 		"section", "main", "mark", "figure", "figcaption",
 		// Inline elements
-		"a", "br", "cite", "code", "img",
+		"a", "br", "cite", "code", "img", "span",
 		// Lists
 		"ol", "ul", "li",
 		// Tables
 		"table", "tbody", "td", "tfoot", "th", "thead", "tr", "colgroup", "col", "caption",
 		// Formatting
-		"u", "i", "em", "small", "strike", "b", "strong", "sub", "sup", "q",
+		"u", "i", "em", "small", "strike", "b", "strong", "sub", "sup", "q", "style",
 		// Definition lists
 		"dd", "dl", "dt",
 	})
 	whitelistAttrs = map[string]map[string]bool{
-		"a":   toSet([]string{"href", "title", "rel", "class"}),
+		"a":   toSet([]string{"href", "title", "rel", "class", "onclick", "id"}),
 		"img": toSet([]string{"src", "alt", "title", "class", "id"}),
-		"div": toSet([]string{"class", "id"}),
+		"div": toSet([]string{"class", "id", "style"}),
 	}
 	protocolAttrs = map[string]map[string]bool{
-		"a": toSet([]string{"href"}),
-		//"img": toSet([]string{"src"}),
+	//"a": toSet([]string{"href"}),
+	//"img": toSet([]string{"src"}),
 	}
 	whitelistProtocols = [][]byte{
 		[]byte("http://"),
