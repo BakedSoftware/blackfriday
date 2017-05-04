@@ -25,22 +25,24 @@ import (
 
 // Html renderer configuration options.
 const (
-	HTML_SKIP_HTML                = 1 << iota // skip preformatted HTML blocks
-	HTML_SKIP_STYLE                           // skip embedded <style> elements
-	HTML_SKIP_IMAGES                          // skip embedded images
-	HTML_SKIP_LINKS                           // skip all links
-	HTML_SANITIZE_OUTPUT                      // strip output of everything that's not known to be safe
-	HTML_SAFELINK                             // only link to trusted protocols
-	HTML_NOFOLLOW_LINKS                       // only link with rel="nofollow"
-	HTML_HREF_TARGET_BLANK                    // add a blank target
-	HTML_TOC                                  // generate a table of contents
-	HTML_OMIT_CONTENTS                        // skip the main contents (for a standalone table of contents)
-	HTML_COMPLETE_PAGE                        // generate a complete HTML page
-	HTML_GITHUB_BLOCKCODE                     // use github fenced code rendering rules
-	HTML_USE_XHTML                            // generate XHTML output instead of HTML
-	HTML_USE_SMARTYPANTS                      // enable smart punctuation substitutions
-	HTML_SMARTYPANTS_FRACTIONS                // enable smart fractions (with HTML_USE_SMARTYPANTS)
-	HTML_SMARTYPANTS_LATEX_DASHES             // enable LaTeX-style dashes (with HTML_USE_SMARTYPANTS)
+	HTML_SKIP_HTML                 = 1 << iota // skip preformatted HTML blocks
+	HTML_SKIP_STYLE                            // skip embedded <style> elements
+	HTML_SKIP_IMAGES                           // skip embedded images
+	HTML_SKIP_LINKS                            // skip all links
+	HTML_SAFELINK                              // only link to trusted protocols
+	HTML_NOFOLLOW_LINKS                        // only link with rel="nofollow"
+	HTML_NOREFERRER_LINKS                      // only link with rel="noreferrer"
+	HTML_HREF_TARGET_BLANK                     // add a blank target
+	HTML_TOC                                   // generate a table of contents
+	HTML_OMIT_CONTENTS                         // skip the main contents (for a standalone table of contents)
+	HTML_COMPLETE_PAGE                         // generate a complete HTML page
+	HTML_USE_XHTML                             // generate XHTML output instead of HTML
+	HTML_USE_SMARTYPANTS                       // enable smart punctuation substitutions
+	HTML_SMARTYPANTS_FRACTIONS                 // enable smart fractions (with HTML_USE_SMARTYPANTS)
+	HTML_SMARTYPANTS_DASHES                    // enable smart dashes (with HTML_USE_SMARTYPANTS)
+	HTML_SMARTYPANTS_LATEX_DASHES              // enable LaTeX-style dashes (with HTML_USE_SMARTYPANTS and HTML_SMARTYPANTS_DASHES)
+	HTML_SMARTYPANTS_ANGLED_QUOTES             // enable angled double quotes (with HTML_USE_SMARTYPANTS) for double quotes rendering
+	HTML_FOOTNOTE_RETURN_LINKS                 // generate a link at the end of a footnote to return to the source
 )
 
 var (
@@ -54,14 +56,32 @@ var (
 	htmlEntity = regexp.MustCompile(`&[a-z]{2,5};`)
 )
 
+type HtmlRendererParameters struct {
+	// Prepend this text to each relative URL.
+	AbsolutePrefix string
+	// Add this text to each footnote anchor, to ensure uniqueness.
+	FootnoteAnchorPrefix string
+	// Show this text inside the <a> tag for a footnote return link, if the
+	// HTML_FOOTNOTE_RETURN_LINKS flag is enabled. If blank, the string
+	// <sup>[return]</sup> is used.
+	FootnoteReturnLinkContents string
+	// If set, add this text to the front of each Header ID, to ensure
+	// uniqueness.
+	HeaderIDPrefix string
+	// If set, add this text to the back of each Header ID, to ensure uniqueness.
+	HeaderIDSuffix string
+}
+
 // Html is a type that implements the Renderer interface for HTML output.
 //
 // Do not create this directly, instead use the HtmlRenderer function.
 type Html struct {
 	flags    int    // HTML_* options
-	closeTag string // how to end singleton tags: either " />\n" or ">\n"
+	closeTag string // how to end singleton tags: either " />" or ">"
 	title    string // document title
 	css      string // optional css file url (used with HTML_COMPLETE_PAGE)
+
+	parameters HtmlRendererParameters
 
 	// table of contents data
 	tocMarker    int
@@ -69,12 +89,15 @@ type Html struct {
 	currentLevel int
 	toc          *bytes.Buffer
 
+	// Track header IDs to prevent ID collision in a single generation.
+	headerIDs map[string]int
+
 	smartypants *smartypantsRenderer
 }
 
 const (
-	xhtmlClose = " />\n"
-	htmlClose  = ">\n"
+	xhtmlClose = " />"
+	htmlClose  = ">"
 )
 
 // HtmlRenderer creates and configures an Html object, which
@@ -85,21 +108,33 @@ const (
 // stylesheet.
 // title and css are only used when HTML_COMPLETE_PAGE is selected.
 func HtmlRenderer(flags int, title string, css string) Renderer {
+	return HtmlRendererWithParameters(flags, title, css, HtmlRendererParameters{})
+}
+
+func HtmlRendererWithParameters(flags int, title string,
+	css string, renderParameters HtmlRendererParameters) Renderer {
 	// configure the rendering engine
 	closeTag := htmlClose
 	if flags&HTML_USE_XHTML != 0 {
 		closeTag = xhtmlClose
 	}
 
+	if renderParameters.FootnoteReturnLinkContents == "" {
+		renderParameters.FootnoteReturnLinkContents = `<sup>[return]</sup>`
+	}
+
 	return &Html{
-		flags:    flags,
-		closeTag: closeTag,
-		title:    title,
-		css:      css,
+		flags:      flags,
+		closeTag:   closeTag,
+		title:      title,
+		css:        css,
+		parameters: renderParameters,
 
 		headerCount:  0,
 		currentLevel: 0,
 		toc:          new(bytes.Buffer),
+
+		headerIDs: make(map[string]int),
 
 		smartypants: smartypants(flags),
 	}
@@ -156,15 +191,34 @@ func (options *Html) GetFlags() int {
 	return options.flags
 }
 
+func (options *Html) TitleBlock(out *bytes.Buffer, text []byte) {
+	text = bytes.TrimPrefix(text, []byte("% "))
+	text = bytes.Replace(text, []byte("\n% "), []byte("\n"), -1)
+	out.WriteString("<h1 class=\"title\">")
+	out.Write(text)
+	out.WriteString("\n</h1>")
+}
+
 func (options *Html) Header(out *bytes.Buffer, text func() bool, level int, id string) {
 	marker := out.Len()
 	doubleSpace(out)
 
+	if id == "" && options.flags&HTML_TOC != 0 {
+		id = fmt.Sprintf("toc_%d", options.headerCount)
+	}
+
 	if id != "" {
+		id = options.ensureUniqueHeaderID(id)
+
+		if options.parameters.HeaderIDPrefix != "" {
+			id = options.parameters.HeaderIDPrefix + id
+		}
+
+		if options.parameters.HeaderIDSuffix != "" {
+			id = id + options.parameters.HeaderIDSuffix
+		}
+
 		out.WriteString(fmt.Sprintf("<h%d id=\"%s\">", level, id))
-	} else if options.flags&HTML_TOC != 0 {
-		// headerCount is incremented in htmlTocHeader
-		out.WriteString(fmt.Sprintf("<h%d id=\"toc_%d\">", level, options.headerCount))
 	} else {
 		out.WriteString(fmt.Sprintf("<h%d>", level))
 	}
@@ -177,7 +231,7 @@ func (options *Html) Header(out *bytes.Buffer, text func() bool, level int, id s
 
 	// are we building a table of contents?
 	if options.flags&HTML_TOC != 0 {
-		options.TocHeader(out.Bytes()[tocMarker:], level)
+		options.TocHeaderWithAnchor(out.Bytes()[tocMarker:], level, id)
 	}
 
 	out.WriteString(fmt.Sprintf("</h%d>\n", level))
@@ -197,17 +251,10 @@ func (options *Html) HRule(out *bytes.Buffer) {
 	doubleSpace(out)
 	out.WriteString("<hr")
 	out.WriteString(options.closeTag)
+	out.WriteByte('\n')
 }
 
 func (options *Html) BlockCode(out *bytes.Buffer, text []byte, lang string) {
-	if options.flags&HTML_GITHUB_BLOCKCODE != 0 {
-		options.BlockCodeGithub(out, text, lang)
-	} else {
-		options.BlockCodeNormal(out, text, lang)
-	}
-}
-
-func (options *Html) BlockCodeNormal(out *bytes.Buffer, text []byte, lang string) {
 	doubleSpace(out)
 
 	// parse out the language names/classes
@@ -220,7 +267,7 @@ func (options *Html) BlockCodeNormal(out *bytes.Buffer, text []byte, lang string
 			continue
 		}
 		if count == 0 {
-			out.WriteString("<pre><code class=\"")
+			out.WriteString("<pre><code class=\"language-")
 		} else {
 			out.WriteByte(' ')
 		}
@@ -232,49 +279,6 @@ func (options *Html) BlockCodeNormal(out *bytes.Buffer, text []byte, lang string
 		out.WriteString("<pre><code>")
 	} else {
 		out.WriteString("\">")
-	}
-
-	attrEscape(out, text)
-	out.WriteString("</code></pre>\n")
-}
-
-// GitHub style code block:
-//
-//              <pre lang="LANG"><code>
-//              ...
-//              </code></pre>
-//
-// Unlike other parsers, we store the language identifier in the <pre>,
-// and don't let the user generate custom classes.
-//
-// The language identifier in the <pre> block gets postprocessed and all
-// the code inside gets syntax highlighted with Pygments. This is much safer
-// than letting the user specify a CSS class for highlighting.
-//
-// Note that we only generate HTML for the first specifier.
-// E.g.
-//              ~~~~ {.python .numbered}        =>      <pre lang="python"><code>
-func (options *Html) BlockCodeGithub(out *bytes.Buffer, text []byte, lang string) {
-	doubleSpace(out)
-
-	// parse out the language name
-	count := 0
-	for _, elt := range strings.Fields(lang) {
-		if elt[0] == '.' {
-			elt = elt[1:]
-		}
-		if len(elt) == 0 {
-			continue
-		}
-		out.WriteString("<pre lang=\"")
-		attrEscape(out, []byte(elt))
-		out.WriteString("\"><code>")
-		count++
-		break
-	}
-
-	if count == 0 {
-		out.WriteString("<pre><code>")
 	}
 
 	attrEscape(out, text)
@@ -349,10 +353,22 @@ func (options *Html) FootnoteItem(out *bytes.Buffer, name, text []byte, flags in
 	if flags&LIST_ITEM_CONTAINS_BLOCK != 0 || flags&LIST_ITEM_BEGINNING_OF_LIST != 0 {
 		doubleSpace(out)
 	}
-	out.WriteString(`<li id="fn:`)
-	out.Write(slugify(name))
+	slug := slugify(name)
+	out.WriteString(`<li id="`)
+	out.WriteString(`fn:`)
+	out.WriteString(options.parameters.FootnoteAnchorPrefix)
+	out.Write(slug)
 	out.WriteString(`">`)
 	out.Write(text)
+	if options.flags&HTML_FOOTNOTE_RETURN_LINKS != 0 {
+		out.WriteString(` <a class="footnote-return" href="#`)
+		out.WriteString(`fnref:`)
+		out.WriteString(options.parameters.FootnoteAnchorPrefix)
+		out.Write(slug)
+		out.WriteString(`">`)
+		out.WriteString(options.parameters.FootnoteReturnLinkContents)
+		out.WriteString(`</a>`)
+	}
 	out.WriteString("</li>\n")
 }
 
@@ -360,7 +376,9 @@ func (options *Html) List(out *bytes.Buffer, text func() bool, flags int) {
 	marker := out.Len()
 	doubleSpace(out)
 
-	if flags&LIST_TYPE_ORDERED != 0 {
+	if flags&LIST_TYPE_DEFINITION != 0 {
+		out.WriteString("<dl>")
+	} else if flags&LIST_TYPE_ORDERED != 0 {
 		out.WriteString("<ol>")
 	} else {
 		out.WriteString("<ul>")
@@ -369,7 +387,9 @@ func (options *Html) List(out *bytes.Buffer, text func() bool, flags int) {
 		out.Truncate(marker)
 		return
 	}
-	if flags&LIST_TYPE_ORDERED != 0 {
+	if flags&LIST_TYPE_DEFINITION != 0 {
+		out.WriteString("</dl>\n")
+	} else if flags&LIST_TYPE_ORDERED != 0 {
 		out.WriteString("</ol>\n")
 	} else {
 		out.WriteString("</ul>\n")
@@ -377,12 +397,25 @@ func (options *Html) List(out *bytes.Buffer, text func() bool, flags int) {
 }
 
 func (options *Html) ListItem(out *bytes.Buffer, text []byte, flags int) {
-	if flags&LIST_ITEM_CONTAINS_BLOCK != 0 || flags&LIST_ITEM_BEGINNING_OF_LIST != 0 {
+	if (flags&LIST_ITEM_CONTAINS_BLOCK != 0 && flags&LIST_TYPE_DEFINITION == 0) ||
+		flags&LIST_ITEM_BEGINNING_OF_LIST != 0 {
 		doubleSpace(out)
 	}
-	out.WriteString("<li>")
+	if flags&LIST_TYPE_TERM != 0 {
+		out.WriteString("<dt>")
+	} else if flags&LIST_TYPE_DEFINITION != 0 {
+		out.WriteString("<dd>")
+	} else {
+		out.WriteString("<li>")
+	}
 	out.Write(text)
-	out.WriteString("</li>\n")
+	if flags&LIST_TYPE_TERM != 0 {
+		out.WriteString("</dt>\n")
+	} else if flags&LIST_TYPE_DEFINITION != 0 {
+		out.WriteString("</dd>\n")
+	} else {
+		out.WriteString("</li>\n")
+	}
 }
 
 func (options *Html) Paragraph(out *bytes.Buffer, text func() bool) {
@@ -410,12 +443,23 @@ func (options *Html) AutoLink(out *bytes.Buffer, link []byte, kind int) {
 	out.WriteString("<a href=\"")
 	if kind == LINK_TYPE_EMAIL {
 		out.WriteString("mailto:")
+	} else {
+		options.maybeWriteAbsolutePrefix(out, link)
 	}
+
 	entityEscapeWithSkip(out, link, skipRanges)
 
+	var relAttrs []string
 	if options.flags&HTML_NOFOLLOW_LINKS != 0 && !isRelativeLink(link) {
-		out.WriteString("\" rel=\"nofollow")
+		relAttrs = append(relAttrs, "nofollow")
 	}
+	if options.flags&HTML_NOREFERRER_LINKS != 0 && !isRelativeLink(link) {
+		relAttrs = append(relAttrs, "noreferrer")
+	}
+	if len(relAttrs) > 0 {
+		out.WriteString(fmt.Sprintf("\" rel=\"%s", strings.Join(relAttrs, " ")))
+	}
+
 	// blank target only add to external link
 	if options.flags&HTML_HREF_TARGET_BLANK != 0 && !isRelativeLink(link) {
 		out.WriteString("\" target=\"_blank")
@@ -459,12 +503,22 @@ func (options *Html) Emphasis(out *bytes.Buffer, text []byte) {
 	out.WriteString("</em>")
 }
 
+func (options *Html) maybeWriteAbsolutePrefix(out *bytes.Buffer, link []byte) {
+	if options.parameters.AbsolutePrefix != "" && isRelativeLink(link) && link[0] != '.' {
+		out.WriteString(options.parameters.AbsolutePrefix)
+		if link[0] != '/' {
+			out.WriteByte('/')
+		}
+	}
+}
+
 func (options *Html) Image(out *bytes.Buffer, link []byte, title []byte, alt []byte) {
 	if options.flags&HTML_SKIP_IMAGES != 0 {
 		return
 	}
 
 	out.WriteString("<img src=\"")
+	options.maybeWriteAbsolutePrefix(out, link)
 	attrEscape(out, link)
 	out.WriteString("\" alt=\"")
 	if len(alt) > 0 {
@@ -477,12 +531,12 @@ func (options *Html) Image(out *bytes.Buffer, link []byte, title []byte, alt []b
 
 	out.WriteByte('"')
 	out.WriteString(options.closeTag)
-	return
 }
 
 func (options *Html) LineBreak(out *bytes.Buffer) {
 	out.WriteString("<br")
 	out.WriteString(options.closeTag)
+	out.WriteByte('\n')
 }
 
 func (options *Html) Link(out *bytes.Buffer, link []byte, title []byte, content []byte) {
@@ -503,14 +557,23 @@ func (options *Html) Link(out *bytes.Buffer, link []byte, title []byte, content 
 	}
 
 	out.WriteString("<a href=\"")
+	options.maybeWriteAbsolutePrefix(out, link)
 	attrEscape(out, link)
 	if len(title) > 0 {
 		out.WriteString("\" title=\"")
 		attrEscape(out, title)
 	}
+	var relAttrs []string
 	if options.flags&HTML_NOFOLLOW_LINKS != 0 && !isRelativeLink(link) {
-		out.WriteString("\" rel=\"nofollow")
+		relAttrs = append(relAttrs, "nofollow")
 	}
+	if options.flags&HTML_NOREFERRER_LINKS != 0 && !isRelativeLink(link) {
+		relAttrs = append(relAttrs, "noreferrer")
+	}
+	if len(relAttrs) > 0 {
+		out.WriteString(fmt.Sprintf("\" rel=\"%s", strings.Join(relAttrs, " ")))
+	}
+
 	// blank target only add to external link
 	if options.flags&HTML_HREF_TARGET_BLANK != 0 && !isRelativeLink(link) {
 		out.WriteString("\" target=\"_blank")
@@ -552,9 +615,13 @@ func (options *Html) StrikeThrough(out *bytes.Buffer, text []byte) {
 
 func (options *Html) FootnoteRef(out *bytes.Buffer, ref []byte, id int) {
 	slug := slugify(ref)
-	out.WriteString(`<sup class="footnote-ref" id="fnref:`)
+	out.WriteString(`<sup class="footnote-ref" id="`)
+	out.WriteString(`fnref:`)
+	out.WriteString(options.parameters.FootnoteAnchorPrefix)
 	out.Write(slug)
-	out.WriteString(`"><a rel="footnote" href="#fn:`)
+	out.WriteString(`"><a rel="footnote" href="#`)
+	out.WriteString(`fn:`)
+	out.WriteString(options.parameters.FootnoteAnchorPrefix)
 	out.Write(slug)
 	out.WriteString(`">`)
 	out.WriteString(strconv.Itoa(id))
@@ -684,7 +751,7 @@ func (options *Html) DocumentFooter(out *bytes.Buffer) {
 
 }
 
-func (options *Html) TocHeader(text []byte, level int) {
+func (options *Html) TocHeaderWithAnchor(text []byte, level int, anchor string) {
 	for level > options.currentLevel {
 		switch {
 		case bytes.HasSuffix(options.toc.Bytes(), []byte("</li>\n")):
@@ -710,14 +777,23 @@ func (options *Html) TocHeader(text []byte, level int) {
 		options.currentLevel--
 	}
 
-	options.toc.WriteString("<li><a href=\"#toc_")
-	options.toc.WriteString(strconv.Itoa(options.headerCount))
+	options.toc.WriteString("<li><a href=\"#")
+	if anchor != "" {
+		options.toc.WriteString(anchor)
+	} else {
+		options.toc.WriteString("toc_")
+		options.toc.WriteString(strconv.Itoa(options.headerCount))
+	}
 	options.toc.WriteString("\">")
 	options.headerCount++
 
 	options.toc.Write(text)
 
 	options.toc.WriteString("</a></li>\n")
+}
+
+func (options *Html) TocHeader(text []byte, level int) {
+	options.TocHeaderWithAnchor(text, level, "")
 }
 
 func (options *Html) TocFinalize() {
@@ -810,6 +886,14 @@ func skipSpace(tag []byte, i int) int {
 	return i
 }
 
+func skipChar(data []byte, start int, char byte) int {
+	i := start
+	for i < len(data) && data[i] == char {
+		i++
+	}
+	return i
+}
+
 func doubleSpace(out *bytes.Buffer) {
 	if out.Len() > 0 {
 		out.WriteByte('\n')
@@ -817,21 +901,49 @@ func doubleSpace(out *bytes.Buffer) {
 }
 
 func isRelativeLink(link []byte) (yes bool) {
-	yes = false
-
 	// a tag begin with '#'
 	if link[0] == '#' {
-		yes = true
+		return true
 	}
 
 	// link begin with '/' but not '//', the second maybe a protocol relative link
 	if len(link) >= 2 && link[0] == '/' && link[1] != '/' {
-		yes = true
+		return true
 	}
 
 	// only the root '/'
 	if len(link) == 1 && link[0] == '/' {
-		yes = true
+		return true
 	}
-	return
+
+	// current directory : begin with "./"
+	if bytes.HasPrefix(link, []byte("./")) {
+		return true
+	}
+
+	// parent directory : begin with "../"
+	if bytes.HasPrefix(link, []byte("../")) {
+		return true
+	}
+
+	return false
+}
+
+func (options *Html) ensureUniqueHeaderID(id string) string {
+	for count, found := options.headerIDs[id]; found; count, found = options.headerIDs[id] {
+		tmp := fmt.Sprintf("%s-%d", id, count+1)
+
+		if _, tmpFound := options.headerIDs[tmp]; !tmpFound {
+			options.headerIDs[id] = count + 1
+			id = tmp
+		} else {
+			id = id + "-1"
+		}
+	}
+
+	if _, found := options.headerIDs[id]; !found {
+		options.headerIDs[id] = 0
+	}
+
+	return id
 }

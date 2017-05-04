@@ -55,6 +55,10 @@ func (options *Latex) BlockCode(out *bytes.Buffer, text []byte, lang string) {
 	}
 }
 
+func (options *Latex) TitleBlock(out *bytes.Buffer, text []byte) {
+
+}
+
 func (options *Latex) BlockQuote(out *bytes.Buffer, text []byte) {
 	out.WriteString("\n\\begin{quotation}\n")
 	out.Write(text)
@@ -255,7 +259,7 @@ func (options *Latex) FootnoteRef(out *bytes.Buffer, ref []byte, id int) {
 }
 
 func needsBackslash(c byte) bool {
-	for _, r := range []byte("_{}%$&\\~") {
+	for _, r := range []byte("_{}%$&\\~#") {
 		if c == r {
 			return true
 		}
